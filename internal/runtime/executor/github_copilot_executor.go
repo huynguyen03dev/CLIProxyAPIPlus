@@ -4,11 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,7 +34,9 @@ const (
 	maxScannerBufferSize = 20_971_520
 
 	// Copilot API header values.
-	copilotUserAgent     = "GithubCopilot/1.0"
+	copilotUserAgent     = "GitHubCopilotChat/0.35.0"
+	copilotEditorVersion = "vscode/1.107.0"
+	copilotPluginVersion = "copilot-chat/0.35.0"
 	copilotIntegrationID = "vscode-chat"
 	// Use "conversation-edits" intent with X-Initiator: agent to bypass rate limits.
 	// This mimics agent workflow continuation behavior.
@@ -80,7 +81,7 @@ func (e *GitHubCopilotExecutor) PrepareRequest(req *http.Request, auth *cliproxy
 	if errToken != nil {
 		return errToken
 	}
-	e.applyHeaders(req, apiToken)
+	e.applyHeaders(req, apiToken, nil)
 	return nil
 }
 
@@ -123,6 +124,7 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 	originalTranslated := sdktranslator.TranslateRequest(from, to, req.Model, originalPayload, false)
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
 	body = e.normalizeModel(req.Model, body)
+	body = flattenAssistantContent(body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, req.Model, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "stream", false)
@@ -136,7 +138,7 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 	if err != nil {
 		return resp, err
 	}
-	e.applyHeaders(httpReq, apiToken)
+	e.applyHeaders(httpReq, apiToken, body)
 
 	// Add Copilot-Vision-Request header if the request contains vision content
 	if detectVisionContent(body) {
@@ -228,6 +230,7 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	originalTranslated := sdktranslator.TranslateRequest(from, to, req.Model, originalPayload, false)
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 	body = e.normalizeModel(req.Model, body)
+	body = flattenAssistantContent(body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, req.Model, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
@@ -245,7 +248,7 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	if err != nil {
 		return nil, err
 	}
-	e.applyHeaders(httpReq, apiToken)
+	e.applyHeaders(httpReq, apiToken, body)
 
 	// Add Copilot-Vision-Request header if the request contains vision content
 	if detectVisionContent(body) {
@@ -416,33 +419,18 @@ func (e *GitHubCopilotExecutor) ensureAPIToken(ctx context.Context, auth *clipro
 	return apiToken.Token, nil
 }
 
-func (e *GitHubCopilotExecutor) applyHeaders(r *http.Request, apiToken string) {
-	editorVersion, pluginVersion := generateCopilotFingerprint(apiToken)
-
+// applyHeaders sets the required headers for GitHub Copilot API requests.
+func (e *GitHubCopilotExecutor) applyHeaders(r *http.Request, apiToken string, body []byte) {
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+apiToken)
 	r.Header.Set("Accept", "application/json")
 	r.Header.Set("User-Agent", copilotUserAgent)
-	r.Header.Set("Editor-Version", editorVersion)
-	r.Header.Set("Editor-Plugin-Version", pluginVersion)
+	r.Header.Set("Editor-Version", copilotEditorVersion)
+	r.Header.Set("Editor-Plugin-Version", copilotPluginVersion)
 	r.Header.Set("Openai-Intent", copilotOpenAIIntent)
 	r.Header.Set("X-Initiator", copilotXInitiator)
 	r.Header.Set("Copilot-Integration-Id", copilotIntegrationID)
 	r.Header.Set("X-Request-Id", uuid.NewString())
-}
-
-func generateCopilotFingerprint(apiToken string) (editorVersion, pluginVersion string) {
-	hash := sha256.Sum256([]byte(apiToken))
-
-	vscodeMinor := 95 + int(binary.BigEndian.Uint16(hash[0:2])%10)
-	vscodePatch := int(binary.BigEndian.Uint16(hash[2:4]) % 5)
-	editorVersion = fmt.Sprintf("vscode/1.%d.%d", vscodeMinor, vscodePatch)
-
-	copilotMinor := 295 + int(binary.BigEndian.Uint16(hash[4:6])%10)
-	copilotPatch := int(binary.BigEndian.Uint16(hash[6:8]) % 100)
-	pluginVersion = fmt.Sprintf("copilot/1.%d.%d", copilotMinor, copilotPatch)
-
-	return
 }
 
 // detectVisionContent checks if the request body contains vision/image content.
@@ -481,6 +469,38 @@ func (e *GitHubCopilotExecutor) normalizeModel(_ string, body []byte) []byte {
 
 func useGitHubCopilotResponsesEndpoint(sourceFormat sdktranslator.Format) bool {
 	return sourceFormat.String() == "openai-response"
+}
+
+// flattenAssistantContent converts assistant message content from array format
+// to a joined string. GitHub Copilot requires assistant content as a string;
+// sending it as an array causes Claude models to re-answer all previous prompts.
+func flattenAssistantContent(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+	result := body
+	for i, msg := range messages.Array() {
+		if msg.Get("role").String() != "assistant" {
+			continue
+		}
+		content := msg.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			continue
+		}
+		var textParts []string
+		for _, part := range content.Array() {
+			if part.Get("type").String() == "text" {
+				if t := part.Get("text").String(); t != "" {
+					textParts = append(textParts, t)
+				}
+			}
+		}
+		joined := strings.Join(textParts, "")
+		path := fmt.Sprintf("messages.%d.content", i)
+		result, _ = sjson.SetBytes(result, path, joined)
+	}
+	return result
 }
 
 // isHTTPSuccess checks if the status code indicates success (2xx).
