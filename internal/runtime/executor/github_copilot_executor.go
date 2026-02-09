@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,8 +37,6 @@ const (
 
 	// Copilot API header values.
 	copilotUserAgent     = "GitHubCopilotChat/0.35.0"
-	copilotEditorVersion = "vscode/1.107.0"
-	copilotPluginVersion = "copilot-chat/0.35.0"
 	copilotIntegrationID = "vscode-chat"
 	// Use "conversation-edits" intent with X-Initiator: agent to bypass rate limits.
 	// This mimics agent workflow continuation behavior.
@@ -421,16 +421,31 @@ func (e *GitHubCopilotExecutor) ensureAPIToken(ctx context.Context, auth *clipro
 
 // applyHeaders sets the required headers for GitHub Copilot API requests.
 func (e *GitHubCopilotExecutor) applyHeaders(r *http.Request, apiToken string, body []byte) {
+	editorVersion, pluginVersion := generateCopilotFingerprint(apiToken)
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+apiToken)
 	r.Header.Set("Accept", "application/json")
 	r.Header.Set("User-Agent", copilotUserAgent)
-	r.Header.Set("Editor-Version", copilotEditorVersion)
-	r.Header.Set("Editor-Plugin-Version", copilotPluginVersion)
+	r.Header.Set("Editor-Version", editorVersion)
+	r.Header.Set("Editor-Plugin-Version", pluginVersion)
 	r.Header.Set("Openai-Intent", copilotOpenAIIntent)
 	r.Header.Set("X-Initiator", copilotXInitiator)
 	r.Header.Set("Copilot-Integration-Id", copilotIntegrationID)
 	r.Header.Set("X-Request-Id", uuid.NewString())
+}
+
+func generateCopilotFingerprint(apiToken string) (editorVersion, pluginVersion string) {
+	hash := sha256.Sum256([]byte(apiToken))
+
+	vscodeMinor := 95 + int(binary.BigEndian.Uint16(hash[0:2])%10)
+	vscodePatch := int(binary.BigEndian.Uint16(hash[2:4]) % 5)
+	editorVersion = fmt.Sprintf("vscode/1.%d.%d", vscodeMinor, vscodePatch)
+
+	copilotMinor := 295 + int(binary.BigEndian.Uint16(hash[4:6])%10)
+	copilotPatch := int(binary.BigEndian.Uint16(hash[6:8]) % 100)
+	pluginVersion = fmt.Sprintf("copilot/1.%d.%d", copilotMinor, copilotPatch)
+
+	return
 }
 
 // detectVisionContent checks if the request body contains vision/image content.
